@@ -1,16 +1,14 @@
 // api/start.js
-// POST /api/start — dipanggil saat user klik "Start Verification"
-// Returns timerKey yang akan dipakai untuk claim session token
+// POST /api/start → kasih signed timerToken ke client
+// Token berisi timestamp start + IP, di-sign pakai HMAC SHA256
+// Gak butuh in-memory storage → aman dari cold start
 
-if (!global.timerStore) global.timerStore = {};
+import crypto from 'crypto';
+
+const SECRET = process.env.VOLTRIX_SECRET || 'fayintz-voltrix-k9x2mz84';
 
 function getIP(req) {
   return (req.headers['x-forwarded-for']||'').split(',')[0].trim() || req.socket?.remoteAddress || 'unknown';
-}
-
-function randStr(n) {
-  const c = 'abcdefghijklmnopqrstuvwxyz0123456789';
-  return Array.from({length:n}, () => c[Math.floor(Math.random()*c.length)]).join('');
 }
 
 export default function handler(req, res) {
@@ -20,21 +18,17 @@ export default function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST')   return res.status(405).json({ success:false });
 
-  const ip       = getIP(req);
-  const timerKey = randStr(40);
+  const ip        = getIP(req);
+  const startedAt = Date.now();
 
-  // Simpan waktu mulai + IP
-  global.timerStore[timerKey] = {
-    ip,
-    startedAt: Date.now(),
-    expire:    Date.now() + 10 * 60 * 1000, // 10 menit max
-  };
+  // Buat payload: ip|startedAt
+  const payload = `${ip}|${startedAt}`;
 
-  // Cleanup expired
-  const now = Date.now();
-  for (const k in global.timerStore) {
-    if (global.timerStore[k].expire < now) delete global.timerStore[k];
-  }
+  // Sign pakai HMAC
+  const sig = crypto.createHmac('sha256', SECRET).update(payload).digest('hex');
 
-  return res.status(200).json({ success:true, timerKey });
+  // Token = base64(payload) + '.' + sig
+  const timerToken = Buffer.from(payload).toString('base64') + '.' + sig;
+
+  return res.status(200).json({ success:true, timerToken });
 }
