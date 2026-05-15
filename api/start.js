@@ -5,6 +5,8 @@
 
 import crypto from 'crypto';
 
+export const config = { api: { bodyParser: true } };
+
 const SECRET = process.env.VOLTRIX_SECRET || 'fayintz-voltrix-k9x2mz84';
 
 function getIP(req) {
