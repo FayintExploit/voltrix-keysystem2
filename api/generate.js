@@ -1,46 +1,47 @@
 // api/generate.js
+// Key format: VOLTRIX-{base64(ip|expire)}.{hmac}
+// Stateless — gak butuh database atau memory
+
 import crypto from 'crypto';
 
 export const config = { api: { bodyParser: true } };
 
 const SECRET  = process.env.VOLTRIX_SECRET || 'fayintz-voltrix-k9x2mz84';
-const KEY_TTL = 24 * 60 * 60 * 1000;
-const SESSION_MAX = 15 * 60 * 1000; // session valid max 15 menit
+const KEY_TTL = 24 * 60 * 60 * 1000; // 24 jam
+const SESSION_MAX = 15 * 60 * 1000;  // session valid 15 menit
 
-if (!global.keyStore)   global.keyStore   = {};
-if (!global.usedTokens) global.usedTokens = {};
-
-function cleanUp() {
-  const now = Date.now();
-  for (const k in global.keyStore)   { if (global.keyStore[k].expire < now) delete global.keyStore[k]; }
-  for (const k in global.usedTokens) { if (global.usedTokens[k] < now)      delete global.usedTokens[k]; }
+function getIP(req) {
+  return (req.headers['x-forwarded-for']||'').split(',')[0].trim() || 'unknown';
 }
 
 function verifySessionToken(sessionToken) {
   try {
-    const dotIdx = sessionToken.lastIndexOf('.');
-    if (dotIdx === -1) return null;
-    const b64    = sessionToken.substring(0, dotIdx);
-    const sig    = sessionToken.substring(dotIdx + 1);
+    const dotIdx  = sessionToken.lastIndexOf('.');
+    if (dotIdx === -1) return false;
+    const b64     = sessionToken.substring(0, dotIdx);
+    const sig     = sessionToken.substring(dotIdx + 1);
     const payload = Buffer.from(b64, 'base64').toString('utf8');
-    const expectedSig = crypto.createHmac('sha256', SECRET).update(payload).digest('hex');
-    if (sig !== expectedSig) return null;
-    const parts     = payload.split('|');
-    const createdAt = parseInt(parts[1]);
-    if (isNaN(createdAt)) return null;
-    if (Date.now() - createdAt > SESSION_MAX) return { valid:false, expired:true };
-    return { valid:true, createdAt };
-  } catch(e) { return null; }
+    const expected = crypto.createHmac('sha256', SECRET).update(payload).digest('hex');
+    if (sig !== expected) return false;
+    const createdAt = parseInt(payload.split('|')[1]);
+    if (isNaN(createdAt)) return false;
+    if (Date.now() - createdAt > SESSION_MAX) return false;
+    return true;
+  } catch(e) { return false; }
 }
 
-function genKey() {
-  const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  const s = () => Array.from({length:4}, () => c[Math.floor(Math.random()*c.length)]).join('');
-  return `VOLTRIX-${s()}-${s()}`;
-}
-
-function getIP(req) {
-  return (req.headers['x-forwarded-for']||'').split(',')[0].trim() || 'unknown';
+function buildKey(expire) {
+  // Payload: expire timestamp
+  const payload = `${expire}`;
+  const sig     = crypto.createHmac('sha256', SECRET).update(payload).digest('hex').substring(0, 16).toUpperCase();
+  // Format: VOLTRIX-XXXX-XXXX-{sig bagian 1}-{sig bagian 2}
+  const p1 = sig.substring(0, 4);
+  const p2 = sig.substring(4, 8);
+  const p3 = sig.substring(8, 12);
+  const p4 = sig.substring(12, 16);
+  // Encode expire ke dalam key
+  const expB64 = Buffer.from(payload).toString('base64').replace(/=/g,'').substring(0,8).toUpperCase();
+  return `VOLTRIX-${p1}${p2}-${p3}${p4}-${expB64}`;
 }
 
 export default function handler(req, res) {
@@ -50,36 +51,18 @@ export default function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST')   return res.status(405).json({ success:false });
 
-  cleanUp();
-
-  const ip = getIP(req);
   const { sessionToken } = req.body || {};
 
-  if (!sessionToken) return res.status(403).json({ success:false, message:'No session token.' });
-
-  const result = verifySessionToken(sessionToken);
-  if (!result)         return res.status(403).json({ success:false, message:'Invalid session. Complete all checkpoints first.' });
-  if (result.expired)  return res.status(403).json({ success:false, message:'Session expired. Please restart.' });
-  if (!result.valid)   return res.status(403).json({ success:false, message:'Invalid session.' });
-
-  // Cek token sudah dipakai (one-time use)
-  if (global.usedTokens[sessionToken]) {
-    // Return key yang sudah ada kalau masih aktif
-    const existing = Object.values(global.keyStore).find(v => v.ip === ip && v.expire > Date.now());
-    if (existing) return res.status(200).json({ success:true, key:existing.key, expire:existing.expire, cached:true });
+  if (!sessionToken) {
+    return res.status(403).json({ success:false, message:'No session token. Complete all checkpoints first.' });
   }
 
-  // Mark token sebagai used
-  global.usedTokens[sessionToken] = Date.now() + SESSION_MAX;
+  if (!verifySessionToken(sessionToken)) {
+    return res.status(403).json({ success:false, message:'Invalid or expired session. Please restart.' });
+  }
 
-  // Cek IP sudah punya key aktif
-  const existingKey = Object.values(global.keyStore).find(v => v.ip === ip && v.expire > Date.now());
-  if (existingKey) return res.status(200).json({ success:true, key:existingKey.key, expire:existingKey.expire, cached:true });
-
-  // Generate key baru
-  const key    = genKey();
   const expire = Date.now() + KEY_TTL;
-  global.keyStore[key] = { key, ip, expire };
+  const key    = buildKey(expire);
 
-  return res.status(200).json({ success:true, key, expire, cached:false });
+  return res.status(200).json({ success:true, key, expire });
 }
